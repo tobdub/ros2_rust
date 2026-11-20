@@ -619,6 +619,104 @@ mod tests {
     }
 
     #[test]
+    fn test_slow_node_callback_gets_latest_message() {
+        // With keep_last(1), a subscription whose callback is slower than the
+        // publisher should skip the messages that arrived in the meantime and
+        // run with the newest one, as in rclcpp.
+        use crate::*;
+        use ros_env::example_interfaces::msg::Int32;
+        use std::time::Duration;
+
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor
+            .create_node(format!("test_slow_node_callback_{}", line!()).as_str())
+            .unwrap();
+        let topic = "test_slow_node_callback";
+        const COUNT: i32 = 50;
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
+        let commands = Arc::clone(executor.commands());
+        let _subscription = node
+            .create_subscription(topic.keep_last(1), move |msg: Int32| {
+                std::thread::sleep(Duration::from_millis(20));
+                received_clone.lock().unwrap().push(msg.data);
+                if msg.data == COUNT - 1 {
+                    commands.halt_spinning();
+                }
+            })
+            .unwrap();
+
+        let publisher = node.create_publisher::<Int32>(topic).unwrap();
+        let ready = publisher.notify_on_subscriber_ready();
+        std::thread::spawn(move || {
+            futures::executor::block_on(ready).unwrap();
+            for data in 0..COUNT {
+                publisher.publish(Int32 { data }).unwrap();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let r = executor.spin(SpinOptions::default().timeout(Duration::from_secs(10)));
+        assert!(r.is_empty(), "{r:?}");
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.last(), Some(&(COUNT - 1)), "{received:?}");
+        // 50 messages 2 ms apart, 20 ms per callback: about 6 callbacks. Every
+        // message would be delivered if they queued up behind the callback.
+        assert!(received.len() < COUNT as usize / 2, "{received:?}");
+    }
+
+    #[test]
+    fn test_pending_async_node_callback_completes() {
+        // An async callback that awaits is not finished by its first poll and
+        // must still be completed by the executor.
+        use crate::*;
+        use futures::channel::oneshot;
+        use ros_env::example_interfaces::msg::Empty;
+        use std::time::Duration;
+
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor
+            .create_node(format!("test_pending_async_callback_{}", line!()).as_str())
+            .unwrap();
+        let topic = "test_pending_async_callback";
+
+        let (done_sender, done) = oneshot::channel();
+        let done_sender = Arc::new(Mutex::new(Some(done_sender)));
+        let done_sender_check = Arc::clone(&done_sender);
+        let _subscription = node
+            .create_async_subscription(topic, move |_: Empty| {
+                let done_sender = Arc::clone(&done_sender);
+                async move {
+                    // Not ready on the first poll.
+                    async_std::task::sleep(Duration::from_millis(10)).await;
+                    if let Some(sender) = done_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                    }
+                }
+            })
+            .unwrap();
+
+        let publisher = node.create_publisher::<Empty>(topic).unwrap();
+        let _publish = executor.commands().run(async move {
+            publisher.notify_on_subscriber_ready().await.unwrap();
+            publisher.publish(Empty::default()).unwrap();
+        });
+
+        let r = executor.spin(
+            SpinOptions::default()
+                .until_promise_resolved(done)
+                .timeout(Duration::from_secs(5)),
+        );
+        assert!(r.is_empty(), "{r:?}");
+        assert!(
+            done_sender_check.lock().unwrap().is_none(),
+            "the async callback did not complete"
+        );
+    }
+
+    #[test]
     fn test_subscription_qos_settings() {
         use crate::*;
         use ros_env::example_interfaces::msg::Empty;
