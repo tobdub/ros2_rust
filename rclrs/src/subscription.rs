@@ -396,11 +396,26 @@ impl SubscriptionHandle {
     /// This is the counterpart to [`Publisher::borrow_loaned_message()`][2]. See its documentation
     /// for more information.
     ///
+    /// If the middleware cannot loan messages for this subscription, the message
+    /// is taken with a regular take into a heap allocation instead.
+    ///
     /// [1]: crate::RclrsError
     /// [2]: crate::Publisher::borrow_loaned_message
     fn take_loaned<T: Message>(
         self: &Arc<Self>,
     ) -> Result<(ReadOnlyLoanedMessage<T>, MessageInfo), RclrsError> {
+        // SAFETY: The subscription handle is valid for the lifetime of self.
+        if !unsafe { rcl_subscription_can_loan_messages(&*self.lock()) } {
+            let mut msg = Box::<T::RmwMsg>::default();
+            let message_info = self.take_inner::<T>(&mut msg)?;
+            return Ok((
+                ReadOnlyLoanedMessage {
+                    storage: LoanStorage::Owned(msg),
+                },
+                message_info,
+            ));
+        }
+
         let mut msg_ptr = std::ptr::null_mut();
         let mut message_info = unsafe { rmw_get_zero_initialized_message_info() };
         unsafe {
@@ -415,8 +430,10 @@ impl SubscriptionHandle {
             .ok()?;
         }
         let read_only_loaned_msg = ReadOnlyLoanedMessage {
-            msg_ptr: msg_ptr as *const T::RmwMsg,
-            handle: Arc::clone(self),
+            storage: LoanStorage::Loaned {
+                msg_ptr: msg_ptr as *const T::RmwMsg,
+                handle: Arc::clone(self),
+            },
         };
         Ok((
             read_only_loaned_msg,
@@ -616,6 +633,73 @@ mod tests {
         assert!(r.is_empty(), "{r:?}");
         let message_was_received = success.load(Ordering::Acquire);
         assert!(message_was_received);
+    }
+
+    #[test]
+    fn test_loaned_subscription_without_loan_support() {
+        use crate::*;
+        use futures::{channel::mpsc, StreamExt};
+        use ros_env::example_interfaces::msg::rmw::String as RmwString;
+
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor
+            .create_node(format!("test_loaned_without_loan_support_{}", line!()).as_str())
+            .unwrap();
+        let topic = "test_loaned_without_loan_support";
+
+        // An unbounded type, which most middlewares cannot loan.
+        let publisher = node.create_publisher::<RmwString>(topic).unwrap();
+        if publisher.can_loan_messages() {
+            // This middleware can loan the type, so the fallback is not used.
+            return;
+        }
+
+        let (sender, mut receiver) = mpsc::unbounded();
+        let node_sender = sender.clone();
+        let _node_subscription = node
+            .create_subscription(topic, move |msg: ReadOnlyLoanedMessage<RmwString>| {
+                let _ = node_sender.unbounded_send(("node", msg.data.to_string()));
+            })
+            .unwrap();
+        let worker = node.create_worker(());
+        let _worker_subscription = worker
+            .create_subscription(topic, move |msg: ReadOnlyLoanedMessage<RmwString>| {
+                let _ = sender.unbounded_send(("worker", msg.data.to_string()));
+            })
+            .unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
+        let promise = executor.commands().run(async move {
+            publisher.notify_on_subscriber_ready().await.unwrap();
+            publisher
+                .publish(RmwString {
+                    data: "hello".into(),
+                })
+                .unwrap();
+            for _ in 0..2 {
+                if let Some(r) = receiver.next().await {
+                    received_clone.lock().unwrap().push(r);
+                }
+            }
+        });
+
+        let r = executor.spin(
+            SpinOptions::default()
+                .until_promise_resolved(promise)
+                .timeout(std::time::Duration::from_secs(5)),
+        );
+        assert!(r.is_empty(), "{r:?}");
+
+        let mut received = received.lock().unwrap().clone();
+        received.sort();
+        assert_eq!(
+            received,
+            [
+                ("node", "hello".to_string()),
+                ("worker", "hello".to_string())
+            ]
+        );
     }
 
     #[test]

@@ -12,12 +12,30 @@ use crate::{rcl_bindings::*, subscription::SubscriptionHandle, ToResult};
 ///
 /// This type may be used in subscription callbacks to receive a message. The
 /// loan is returned by dropping the `ReadOnlyLoanedMessage`.
+///
+/// If the middleware cannot loan messages for the subscription (for example
+/// because the message type is unbounded), the message is taken into a heap
+/// allocation instead, which is dropped with the `ReadOnlyLoanedMessage`. This
+/// matches what rclcpp does for subscriptions that cannot loan.
 pub struct ReadOnlyLoanedMessage<T>
 where
     T: Message,
 {
-    pub(super) msg_ptr: *const T::RmwMsg,
-    pub(super) handle: Arc<SubscriptionHandle>,
+    pub(super) storage: LoanStorage<T>,
+}
+
+/// Where the message of a [`ReadOnlyLoanedMessage`] lives.
+pub(super) enum LoanStorage<T>
+where
+    T: Message,
+{
+    /// Loaned from the middleware, returned on drop.
+    Loaned {
+        msg_ptr: *const T::RmwMsg,
+        handle: Arc<SubscriptionHandle>,
+    },
+    /// Taken with a regular take because the middleware cannot loan it.
+    Owned(Box<T::RmwMsg>),
 }
 
 impl<T> Deref for ReadOnlyLoanedMessage<T>
@@ -26,7 +44,10 @@ where
 {
     type Target = T::RmwMsg;
     fn deref(&self) -> &Self::Target {
-        unsafe { &*self.msg_ptr }
+        match &self.storage {
+            LoanStorage::Loaned { msg_ptr, .. } => unsafe { &**msg_ptr },
+            LoanStorage::Owned(msg) => msg,
+        }
     }
 }
 
@@ -35,13 +56,12 @@ where
     T: Message,
 {
     fn drop(&mut self) {
-        unsafe {
-            rcl_return_loaned_message_from_subscription(
-                &*self.handle.lock(),
-                self.msg_ptr as *mut _,
-            )
-            .ok()
-            .unwrap();
+        if let LoanStorage::Loaned { msg_ptr, handle } = &self.storage {
+            unsafe {
+                rcl_return_loaned_message_from_subscription(&*handle.lock(), *msg_ptr as *mut _)
+                    .ok()
+                    .unwrap();
+            }
         }
     }
 }
