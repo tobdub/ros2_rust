@@ -278,58 +278,8 @@ where
     ) -> Result<Arc<Self>, RclrsError> {
         // This loads the introspection type support library.
         let metadata = DynamicMessageMetadata::new(topic_type)?;
-        let SubscriptionOptions { topic, qos } = options.into();
-        // However, we also need the regular type support library –
-        // the rosidl_typesupport_c one.
-        let message_type = &metadata.message_type;
-        let type_support_library =
-            get_type_support_library(&message_type.package_name, "rosidl_typesupport_c")?;
-        // SAFETY: The symbol type of the type support getter function can be trusted
-        // assuming the install dir hasn't been tampered with.
-        // The pointer returned by this function is kept valid by keeping the library loaded.
-        let type_support_ptr = unsafe {
-            get_type_support_handle(
-                type_support_library.as_ref(),
-                "rosidl_typesupport_c",
-                message_type,
-            )?
-        };
-
-        let topic_c_string = CString::new(topic).map_err(|err| RclrsError::StringContainsNul {
-            err,
-            s: topic.into(),
-        })?;
-
-        // SAFETY: No preconditions for this function.
-        let mut rcl_subscription_options = unsafe { rcl_subscription_get_default_options() };
-        rcl_subscription_options.qos = qos.into();
-        // SAFETY: Getting a zero-initialized value is always safe.
-        let mut rcl_subscription = unsafe { rcl_get_zero_initialized_subscription() };
-        {
-            let rcl_node = node_handle.rcl_node.lock().unwrap();
-            let _lifecycle_lock = ENTITY_LIFECYCLE_MUTEX.lock().unwrap();
-            unsafe {
-                // SAFETY:
-                // * The rcl_subscription is zero-initialized as mandated by this function.
-                // * The rcl_node is kept alive by the NodeHandle because it is a dependency of the subscription.
-                // * The topic name and the options are copied by this function, so they can be dropped afterwards.
-                // * The entity lifecycle mutex is locked to protect against the risk of global
-                //   variables in the rmw implementation being unsafely modified during cleanup.
-                rcl_subscription_init(
-                    &mut rcl_subscription,
-                    &*rcl_node,
-                    type_support_ptr,
-                    topic_c_string.as_ptr(),
-                    &rcl_subscription_options,
-                )
-                .ok()?;
-            }
-        }
-
-        let handle = Arc::new(SubscriptionHandle {
-            rcl_subscription: Mutex::new(rcl_subscription),
-            node_handle: Arc::clone(node_handle),
-        });
+        let (handle, type_support_library) =
+            create_runtime_typed_subscription(&metadata.message_type, options, node_handle)?;
 
         let callback = Arc::new(Mutex::new(callback.into()));
         let metadata = Arc::new(metadata);
@@ -366,6 +316,69 @@ where
     pub fn structure(&self) -> &MessageStructure {
         &self.metadata.structure
     }
+}
+
+/// Creates an rcl subscription for a message type that is only known at
+/// runtime, by loading the type's `rosidl_typesupport_c` library.
+///
+/// The returned library must be kept loaded for as long as the subscription
+/// exists, since the subscription refers to the type support inside it.
+pub(crate) fn create_runtime_typed_subscription<'a>(
+    message_type: &MessageTypeName,
+    options: impl Into<SubscriptionOptions<'a>>,
+    node_handle: &Arc<NodeHandle>,
+) -> Result<(Arc<SubscriptionHandle>, Arc<libloading::Library>), RclrsError> {
+    let SubscriptionOptions { topic, qos } = options.into();
+    // We need the regular type support library – the rosidl_typesupport_c one.
+    let type_support_library =
+        get_type_support_library(&message_type.package_name, "rosidl_typesupport_c")?;
+    // SAFETY: The symbol type of the type support getter function can be trusted
+    // assuming the install dir hasn't been tampered with.
+    // The pointer returned by this function is kept valid by keeping the library loaded.
+    let type_support_ptr = unsafe {
+        get_type_support_handle(
+            type_support_library.as_ref(),
+            "rosidl_typesupport_c",
+            message_type,
+        )?
+    };
+
+    let topic_c_string = CString::new(topic).map_err(|err| RclrsError::StringContainsNul {
+        err,
+        s: topic.into(),
+    })?;
+
+    // SAFETY: No preconditions for this function.
+    let mut rcl_subscription_options = unsafe { rcl_subscription_get_default_options() };
+    rcl_subscription_options.qos = qos.into();
+    // SAFETY: Getting a zero-initialized value is always safe.
+    let mut rcl_subscription = unsafe { rcl_get_zero_initialized_subscription() };
+    {
+        let rcl_node = node_handle.rcl_node.lock().unwrap();
+        let _lifecycle_lock = ENTITY_LIFECYCLE_MUTEX.lock().unwrap();
+        unsafe {
+            // SAFETY:
+            // * The rcl_subscription is zero-initialized as mandated by this function.
+            // * The rcl_node is kept alive by the NodeHandle because it is a dependency of the subscription.
+            // * The topic name and the options are copied by this function, so they can be dropped afterwards.
+            // * The entity lifecycle mutex is locked to protect against the risk of global
+            //   variables in the rmw implementation being unsafely modified during cleanup.
+            rcl_subscription_init(
+                &mut rcl_subscription,
+                &*rcl_node,
+                type_support_ptr,
+                topic_c_string.as_ptr(),
+                &rcl_subscription_options,
+            )
+            .ok()?;
+        }
+    }
+
+    let handle = Arc::new(SubscriptionHandle {
+        rcl_subscription: Mutex::new(rcl_subscription),
+        node_handle: Arc::clone(node_handle),
+    });
+    Ok((handle, type_support_library))
 }
 
 #[cfg(test)]

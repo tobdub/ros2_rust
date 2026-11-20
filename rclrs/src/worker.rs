@@ -328,6 +328,51 @@ impl<Payload: 'static + Send + Sync> WorkerState<Payload> {
         )
     }
 
+    /// Creates a [`WorkerSerializedSubscription`][1], which receives messages in
+    /// their serialized form without deserializing them.
+    ///
+    /// The message type is given at runtime, like for
+    /// [`Worker::create_dynamic_subscription`][2].
+    ///
+    /// The callback runs on the worker's thread and borrows the bytes from a
+    /// buffer that the subscription reuses for every message, so receiving a
+    /// message does not allocate once the buffer has grown to the message size.
+    ///
+    /// ```
+    /// # use rclrs::*;
+    /// # let executor = Context::default().create_basic_executor();
+    /// # let node = executor.create_node("my_node").unwrap();
+    /// let worker = node.create_worker(0_usize);
+    /// let subscription = worker.create_serialized_subscription(
+    ///     "test_msgs/msg/Empty".try_into()?,
+    ///     "my_topic",
+    ///     |total_bytes: &mut usize, bytes: &[u8], _info: MessageInfo| {
+    ///         *total_bytes += bytes.len();
+    ///     },
+    /// )?;
+    /// # Ok::<(), RclrsError>(())
+    /// ```
+    ///
+    /// [1]: crate::WorkerSerializedSubscription
+    /// [2]: crate::WorkerState::create_dynamic_subscription
+    pub fn create_serialized_subscription<'a, F>(
+        &self,
+        topic_type: MessageTypeName,
+        options: impl Into<SubscriptionOptions<'a>>,
+        callback: F,
+    ) -> Result<crate::WorkerSerializedSubscription<Payload>, RclrsError>
+    where
+        F: FnMut(&mut Payload, &[u8], MessageInfo) + Send + 'static,
+    {
+        crate::SerializedSubscriptionState::<Worker<Payload>>::create(
+            topic_type,
+            options,
+            crate::SerializedSubscriptionCallback::worker(callback),
+            self.node.handle(),
+            &self.commands,
+        )
+    }
+
     /// Creates a [`WorkerService`].
     ///
     /// Unlike services created from a [`Node`], the callbacks for these services

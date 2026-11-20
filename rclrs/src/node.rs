@@ -944,6 +944,55 @@ impl NodeState {
         )
     }
 
+    /// Creates a [`SerializedSubscription`][1], which receives messages in their
+    /// serialized form without deserializing them.
+    ///
+    /// The message type is given at runtime, like for
+    /// [`Node::create_dynamic_subscription`][2]. Its type support library must be
+    /// installed, but no generated Rust code is needed.
+    ///
+    /// Each message is taken into its own [`SerializedMessage`][3], and the
+    /// callback runs on the executor like for [`Node::create_subscription`][4].
+    /// To receive the bytes without an allocation per message, use
+    /// [`WorkerState::create_serialized_subscription`][5].
+    ///
+    /// ```
+    /// # use rclrs::*;
+    /// # let executor = Context::default().create_basic_executor();
+    /// # let node = executor.create_node("my_node").unwrap();
+    /// let subscription = node.create_serialized_subscription(
+    ///     "test_msgs/msg/Empty".try_into()?,
+    ///     "my_topic",
+    ///     |msg: SerializedMessage, _info: MessageInfo| {
+    ///         println!("Received {} bytes", msg.as_bytes().len());
+    ///     },
+    /// )?;
+    /// # Ok::<(), RclrsError>(())
+    /// ```
+    ///
+    /// [1]: crate::SerializedSubscription
+    /// [2]: crate::NodeState::create_dynamic_subscription
+    /// [3]: crate::SerializedMessage
+    /// [4]: crate::NodeState::create_subscription
+    /// [5]: crate::WorkerState::create_serialized_subscription
+    pub fn create_serialized_subscription<'a, F>(
+        &self,
+        topic_type: MessageTypeName,
+        options: impl Into<SubscriptionOptions<'a>>,
+        callback: F,
+    ) -> Result<crate::SerializedSubscription, RclrsError>
+    where
+        F: Fn(crate::SerializedMessage, MessageInfo) + Send + Sync + 'static,
+    {
+        crate::SerializedSubscriptionState::<Node>::create(
+            topic_type,
+            options,
+            crate::SerializedSubscriptionCallback::node(callback),
+            &self.handle,
+            self.commands.async_worker_commands(),
+        )
+    }
+
     /// Creates a [`DynamicSubscription`] with an async callback.
     ///
     /// For the behavior and API refer to [`Node::create_async_subscription`][1], except two key
