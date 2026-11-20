@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration, vec::Vec};
 use crate::{
     error::{to_rclrs_result, RclReturnCode, RclrsError, ToResult},
     log_error,
+    logging::ToLogParams,
     rcl_bindings::*,
     Context, ContextHandle,
 };
@@ -86,7 +87,8 @@ impl WaitSet {
     /// comes first.
     ///
     /// Once one or more items in the wait set are ready, `f` will be triggered
-    /// for each ready item.
+    /// for each ready item. If `f` returns an error for an item, the error is
+    /// logged and the remaining ready items are still processed.
     ///
     /// This function does not change the entities registered in the wait set.
     ///
@@ -145,7 +147,15 @@ impl WaitSet {
             // the callback for those that were.
             for waiter in self.primitives.values_mut().flat_map(|v| v) {
                 if let Some(ready) = waiter.is_ready(&self.handle.rcl_wait_set) {
-                    f(ready, &mut *waiter.primitive)?;
+                    // An error from one primitive must not stop the others: returning
+                    // it here would end the worker's wait set runner, so every other
+                    // primitive in this wait set would silently stop being served.
+                    if let Err(err) = f(ready, &mut *waiter.primitive) {
+                        log_error!(
+                            "rclrs.WaitSet.wait".throttle(Duration::from_secs(1)),
+                            "Error while executing a wait set primitive: {err}",
+                        );
+                    }
                 }
             }
         }
@@ -282,6 +292,75 @@ mod tests {
         // testing that will give us more introspection.
         assert!(std::time::Instant::now() - start < Duration::from_secs(1));
 
+        Ok(())
+    }
+
+    #[test]
+    fn failing_primitive_does_not_stop_the_others() -> Result<(), RclrsError> {
+        use ros_env::test_msgs::msg::{rmw::UnboundedSequences, Empty};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor.create_node("test_failing_primitive")?;
+        let worker = node.create_worker(());
+
+        // A loaned take of an unbounded type fails on every middleware that cannot
+        // loan it, so executing this subscription returns an error.
+        let _failing = worker.create_subscription::<UnboundedSequences, _>(
+            "test_failing_primitive_loaned",
+            |_: ReadOnlyLoanedMessage<UnboundedSequences>| {},
+        )?;
+        let failing_publisher =
+            node.create_publisher::<UnboundedSequences>("test_failing_primitive_loaned")?;
+        if failing_publisher.can_loan_messages() {
+            // This middleware can loan the type, so there is no failure to test.
+            return Ok(());
+        }
+
+        let received = Arc::new(AtomicBool::new(false));
+        let received_clone = Arc::clone(&received);
+        let _healthy = worker.create_subscription::<Empty, _>(
+            "test_failing_primitive_healthy",
+            move |_: Empty| received_clone.store(true, Ordering::Release),
+        )?;
+
+        let healthy_publisher = node.create_publisher::<Empty>("test_failing_primitive_healthy")?;
+
+        let commands = Arc::clone(executor.commands());
+        let received_check = Arc::clone(&received);
+        let promise = commands.run(async move {
+            failing_publisher
+                .notify_on_subscriber_ready()
+                .await
+                .unwrap();
+            healthy_publisher
+                .notify_on_subscriber_ready()
+                .await
+                .unwrap();
+            failing_publisher
+                .publish(UnboundedSequences::default())
+                .unwrap();
+            // Give the failing subscription time to be executed first.
+            async_std::task::sleep(Duration::from_millis(100)).await;
+            while !received_check.load(Ordering::Acquire) {
+                healthy_publisher.publish(Empty::default()).unwrap();
+                async_std::task::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        executor.spin(
+            SpinOptions::default()
+                .until_promise_resolved(promise)
+                .timeout(Duration::from_secs(5)),
+        );
+
+        assert!(
+            received.load(Ordering::Acquire),
+            "a failing subscription stopped the other subscription of its worker"
+        );
         Ok(())
     }
 }
